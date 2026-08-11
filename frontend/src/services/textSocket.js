@@ -10,7 +10,8 @@ export function connectTextSocket(onMessage) {
     }
 
     socket = new WebSocket(
-      `ws://localhost:5000?companyId=${companyId}&mode=text`
+      // `ws://localhost:5000?companyId=${companyId}&mode=text`
+      `wss://nventmarketing.onrender.com?companyId=${companyId}&mode=text`
     );
 
     socket.onopen = () => {

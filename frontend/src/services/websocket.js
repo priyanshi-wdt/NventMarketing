@@ -13,7 +13,8 @@ export async function connectWebSocket() {
 
     socket = new WebSocket(
       // `wss://solar-ai-ufc1.onrender.com?companyId=${companyId}&mode=voice`
-      `ws://localhost:5000?companyId=${companyId}&mode=voice`,
+      `wss://neventmarketing.onrender.com?companyId=${companyId}&mode=voice`
+      // `ws://localhost:5000?companyId=${companyId}&mode=voice`,
     );
     socket.binaryType = "arraybuffer";
 

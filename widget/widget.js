@@ -1,8 +1,8 @@
 window.SolarAI = {
   init(config = {}) {
     const iframe = document.createElement("iframe");
-    // iframe.src = `https://solar-ai-livid.vercel.app/?companyId=${encodeURIComponent(config.companyId)}&imageSrc=${encodeURIComponent(config.imageSrc)}`;
-    iframe.src = `http://localhost:5173/?companyId=${encodeURIComponent(config.companyId)}&imageSrc=${encodeURIComponent(config.imageSrc)}`;
+    iframe.src = `nvent-marketing-dad9swn8c-wdt3.vercel.app/?companyId=${encodeURIComponent(config.companyId)}&imageSrc=${encodeURIComponent(config.imageSrc)}`;
+    // iframe.src = `http://localhost:5173/?companyId=${encodeURIComponent(config.companyId)}&imageSrc=${encodeURIComponent(config.imageSrc)}`;
     iframe.allow = "microphone";
     iframe.style.position = "fixed";
     iframe.style.bottom = "20px";
