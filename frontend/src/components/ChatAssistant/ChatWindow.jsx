@@ -152,7 +152,7 @@ export default function ChatWindow({ onClose }) {
         <div className="chat-header-left">
           <img src={icon} alt="Support" className="chat-header-icon" />
 
-          <span>Support</span>
+          <span>Nvent Support</span>
         </div>
         <button
           onClick={() => {
