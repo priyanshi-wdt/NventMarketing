@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NventmarketingAIAgent · AI + nventmarketing websites</title>
+    <!-- Font & Icons -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap"
+        rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+    <!-- widget.css (placeholder) -->
+    <link rel="stylesheet" href="widget.css" />
+    
+</head>
+
+<body>
+
+
+    <div>
+        <h2>This is Nventmarketing site</h2>
+    </div>
+
+    <!-- widget & init (as per spec) -->
+    <script src="widget.js"></script>
+    <script>
+        // SolarAI init (with companyId)
+        if (typeof SolarAI !== 'undefined' && SolarAI.init) {
+            SolarAI.init({
+                companyId: "nventmarketing",
+                imageSrc:"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSZ_-7p9nQL9V_X8t08LB1vRXlnrlndZAZwoTlb8ynUUw&s=10"
+            });
+        } else {
+            console.warn('SolarAI widget not loaded — check widget.js');
+        }
+    </script>
+</body>
+
+</html>

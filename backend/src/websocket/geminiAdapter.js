@@ -1,0 +1,483 @@
+const { GoogleGenAI } = require("@google/genai");
+const conversationStore = require("../services/conversationStore");
+// const solarPrompt = require("../prompts/solarPrompt");
+const buildPrompt = require("../prompts/buildPrompt");
+const { getCompany } = require("../services/companyService");
+const isBusinessOpen = require("../utils/isBusinessOpen");
+const Conversation = require("../models/Conversation");
+const clientManager = require("./clientManager");
+const { clearInactivityTimers } = require("../utils/inactivityManager");
+
+// NOTE: gemini-live-2.5-flash-preview was retired (shutdown Dec 9, 2025).
+// If this model ever stops working, check
+// https://ai.google.dev/gemini-api/docs/live-api for the current id.
+const MODEL = "gemini-3.1-flash-live-preview";
+
+class GeminiAdapter {
+  constructor() {
+    this.ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+    });
+
+    // frontend websocket -> Gemini session
+    this.sessions = new Map();
+
+    // frontend websocket -> in-flight connection promise
+    this.pending = new Map();
+
+    // frontend websocket -> accumulating transcript text for the
+    // current turn (transcription arrives in small chunks, we
+    // flush to the DB once on turnComplete instead of once per chunk)
+    this.inputBuffers = new Map();
+    this.outputBuffers = new Map();
+
+    // Voice conversation completion state
+    this.completionRequested = new Map();
+  }
+
+  async create(socket) {
+    console.log("🚀 Creating Gemini Live Session...");
+
+    const companyId = socket.companyId || "abc-solar";
+
+    const company = await getCompany(companyId);
+
+    if (!company) {
+      throw new Error(`Company not found: ${companyId}`);
+    }
+
+    const representativeAvailable = isBusinessOpen(company);
+
+    const prompt = buildPrompt(company, representativeAvailable, "voice");
+    // Start the DB conversation record before Gemini connects so
+    // there's no race between the greeting message and logging it.
+    const conversationId = await conversationStore.start({
+  socket,
+  companyId,
+  conversationType: "voice",
+});
+
+socket.conversationId = conversationId;
+
+clientManager.createConversation(
+  conversationId,
+  socket,
+  companyId
+);
+
+console.log(
+  "🆕 New voice conversation started:",
+  conversationId
+);
+
+    const session = await this.ai.live.connect({
+      model: MODEL,
+
+      config: {
+        responseModalities: ["AUDIO"],
+
+        // Ask Gemini to also transcribe both sides of the audio
+        // conversation as text so we have something to store in
+        // Mongo besides raw audio bytes.
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: "end_conversation",
+                description:
+                  "End the voice conversation when the customer's request is complete, the customer has no remaining questions, or the customer clearly indicates that they are finished or saying goodbye. Do not call this function for temporary pauses or when the customer may still need assistance.",
+              },
+              {
+                name: "connect_representative",
+                description:
+                  "Connect the customer with a live representative when the customer clearly asks to speak with a representative or explicitly agrees to speak with one after the AI offers it. Do not call this function merely because the customer asks about products, services, pricing, installation, or other normal business questions.",
+              },
+            ],
+          },
+        ],
+
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: "Aoede",
+            },
+          },
+        },
+
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            disabled: false,
+            startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+            endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
+            silenceDurationMs: 600,
+          },
+        },
+        systemInstruction: prompt,
+        //         systemInstruction: `
+        // You are ABC Solar's AI Voice Receptionist.
+
+        // Behavior:
+        // - Always greet first.
+        // - Introduce yourself.
+        // - Speak naturally.
+        // - Keep responses short.
+        // - Ask only one question at a time.
+        // - Remember previous answers.
+        // - If user interrupts you, immediately stop speaking.
+        // - If user says wait, pause until they continue.
+        // `,
+      },
+
+      callbacks: {
+        onopen: () => {
+          console.log("✅ Gemini Connected");
+        },
+
+        onmessage: async (message) => {
+          await this.handleMessage(socket, message);
+        },
+
+        onclose: (event) => {
+          console.log("❌ Gemini Closed", event?.code, event?.reason);
+          this.sessions.delete(socket);
+          this.pending.delete(socket);
+          this.inputBuffers.delete(socket);
+          this.outputBuffers.delete(socket);
+          this.completionRequested.delete(socket);
+        },
+
+        onerror: (err) => {
+          console.error("Gemini Error");
+          console.error(err);
+        },
+      },
+    });
+
+    this.sessions.set(socket, session);
+    console.log("✅ Session Stored");
+
+    // AI greets immediately
+    session.sendClientContent({
+      turns: [
+        {
+          role: "user",
+          parts: [
+            { text: "The customer has just connected. Greet them first." },
+          ],
+        },
+      ],
+      turnComplete: true,
+    });
+
+    return session;
+  }
+
+  async get(socket) {
+    if (this.sessions.has(socket)) {
+      return this.sessions.get(socket);
+    }
+
+    if (this.pending.has(socket)) {
+      return this.pending.get(socket);
+    }
+
+    const creationPromise = this.create(socket).finally(() => {
+      this.pending.delete(socket);
+    });
+
+    this.pending.set(socket, creationPromise);
+
+    return creationPromise;
+  }
+
+  async sendAudio(socket, pcmBuffer) {
+    const conversationId = conversationStore.getSessionId(socket);
+
+    const activeConversation = clientManager.getConversation(conversationId);
+
+    if (
+      activeConversation &&
+      (activeConversation.status === "WAITING" ||
+        activeConversation.status === "REPRESENTATIVE")
+    ) {
+      return;
+    }
+
+    const session = await this.get(socket);
+
+    session.sendRealtimeInput({
+      audio: {
+        data: pcmBuffer.toString("base64"),
+        mimeType: "audio/pcm;rate=16000",
+      },
+    });
+  }
+
+  async sendText(socket, text) {
+    const session = await this.get(socket);
+
+    // Typed messages are already text, log immediately.
+    await conversationStore.append({
+      socket,
+      role: "user",
+      text,
+      source: "text",
+    });
+
+    session.sendClientContent({
+      turns: [
+        {
+          role: "user",
+          parts: [{ text }],
+        },
+      ],
+      turnComplete: true,
+    });
+  }
+
+  async signalAudioStreamEnd(socket) {
+    const session = this.sessions.get(socket);
+    if (!session) return;
+
+    session.sendRealtimeInput({ audioStreamEnd: true });
+  }
+
+  async handleMessage(socket, message) {
+    if (message.setupComplete) {
+      return;
+    }
+
+    // User interrupted AI — also means the AI's partial reply for
+    // this turn shouldn't be treated as final; drop the buffer.
+    if (message.serverContent?.interrupted) {
+      this.outputBuffers.delete(socket);
+      socket.send(JSON.stringify({ type: "INTERRUPTED" }));
+      return;
+    }
+
+    // ---------- Live transcripts (voice) ----------
+    const inputTranscript = message.serverContent?.inputTranscription?.text;
+    if (inputTranscript) {
+      const prev = this.inputBuffers.get(socket) || "";
+      this.inputBuffers.set(socket, prev + inputTranscript);
+    }
+
+    const outputTranscript = message.serverContent?.outputTranscription?.text;
+
+    if (outputTranscript) {
+      const prev = this.outputBuffers.get(socket) || "";
+
+      this.outputBuffers.set(socket, prev + outputTranscript);
+    }
+
+    // ---------- Gemini function/tool call ----------
+    if (message.toolCall?.functionCalls) {
+      for (const functionCall of message.toolCall.functionCalls) {
+        console.log("🔧 Gemini called function:", functionCall.name);
+
+        if (functionCall.name === "end_conversation") {
+          console.log("🛑 AI requested conversation end");
+
+          this.completionRequested.set(socket, true);
+
+          const session = this.sessions.get(socket);
+
+          if (session) {
+            session.sendToolResponse({
+              functionResponses: [
+                {
+                  name: functionCall.name,
+                  id: functionCall.id,
+                  response: {
+                    result: "Conversation ending.",
+                  },
+                },
+              ],
+            });
+          }
+
+          // Tell frontend immediately
+          socket.send(
+            JSON.stringify({
+              type: "CONVERSATION_COMPLETE",
+            }),
+          );
+        }
+
+        if (functionCall.name === "connect_representative") {
+          console.log("📞 AI requested representative connection");
+
+          const conversationId = conversationStore.getSessionId(socket);
+
+          const activeConversation =
+            clientManager.getConversation(conversationId);
+
+          if (!activeConversation) {
+            console.error("❌ Voice conversation not found:", conversationId);
+
+            continue;
+          }
+
+          activeConversation.awaitingRepresentativeConfirmation = false;
+          activeConversation.status = "WAITING";
+          activeConversation.waitingSince = new Date();
+
+          clearInactivityTimers(socket);
+
+          // Tell Gemini that the tool call was handled
+          const session = this.sessions.get(socket);
+
+          if (session) {
+            session.sendToolResponse({
+              functionResponses: [
+                {
+                  name: functionCall.name,
+                  id: functionCall.id,
+                  response: {
+                    result:
+                      "The customer is now waiting for a live representative. Do not continue the normal AI conversation.",
+                  },
+                },
+              ],
+            });
+          }
+
+          // Update MongoDB
+          await Conversation.updateOne(
+            { sessionId: conversationId },
+            {
+              status: "waiting",
+            },
+          );
+
+          // Notify representative dashboard
+          clientManager.broadcastToRepresentatives({
+            type: "NEW_WAITING_CONVERSATION",
+            conversationId,
+            companyId: activeConversation.companyId,
+          });
+
+          console.log(
+            "📨 Voice customer waiting for representative:",
+            conversationId,
+          );
+
+          // Tell frontend
+          socket.send(
+            JSON.stringify({
+              type: "WAITING_FOR_REPRESENTATIVE",
+              text: "Please wait while we connect you with a representative.",
+            }),
+          );
+
+          continue;
+        }
+      }
+    }
+
+    const parts = message.serverContent?.modelTurn?.parts || [];
+
+    for (const part of parts) {
+      if (part.thought) continue;
+
+      // ---------- TEXT (rare with AUDIO-only responseModalities) ----------
+      if (part.text) {
+        console.log("🤖", part.text);
+
+        // conversationStore.append(socket, "assistant", part.text, "text");
+
+        socket.send(
+          JSON.stringify({
+            type: "TEXT",
+            text: part.text,
+          }),
+        );
+      }
+
+      // ---------- AUDIO ----------
+      if (part.inlineData) {
+        socket.send(
+          JSON.stringify({
+            type: "AUDIO",
+            mimeType: part.inlineData.mimeType,
+            data: part.inlineData.data,
+          }),
+        );
+      }
+    }
+
+    // Turn finished — flush accumulated transcripts to the DB.
+    if (message.serverContent?.turnComplete) {
+      const userText = this.inputBuffers.get(socket);
+      const aiText = this.outputBuffers.get(socket);
+
+      if (userText) {
+        await conversationStore.append({
+          socket,
+          role: "user",
+          text: userText,
+          source: "voice",
+        });
+      }
+
+      if (aiText) {
+        await conversationStore.append({
+          socket,
+          role: "assistant",
+          text: aiText,
+          source: "voice",
+        });
+      }
+      // this.inputBuffers.delete(socket);
+      // this.outputBuffers.delete(socket);
+
+      // socket.send(JSON.stringify({ type: "TURN_COMPLETE" }));
+      this.inputBuffers.delete(socket);
+      this.outputBuffers.delete(socket);
+
+      const shouldEnd = this.completionRequested.get(socket) === true;
+
+      if (shouldEnd) {
+        console.log("🛑 Conversation completed by AI");
+
+        this.completionRequested.delete(socket);
+
+        socket.send(
+          JSON.stringify({
+            type: "CONVERSATION_COMPLETE",
+          }),
+        );
+
+        return;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "TURN_COMPLETE",
+        }),
+      );
+    }
+  }
+
+  async close(socket) {
+    const session = this.sessions.get(socket);
+
+    await conversationStore.end(socket);
+
+    if (!session) return;
+
+    console.log("🛑 Closing Gemini Session");
+
+    session.close();
+
+    this.sessions.delete(socket);
+    this.pending.delete(socket);
+    this.inputBuffers.delete(socket);
+    this.outputBuffers.delete(socket);
+  }
+}
+
+module.exports = new GeminiAdapter();
