@@ -52,23 +52,16 @@ class GeminiAdapter {
     // Start the DB conversation record before Gemini connects so
     // there's no race between the greeting message and logging it.
     const conversationId = await conversationStore.start({
-  socket,
-  companyId,
-  conversationType: "voice",
-});
+      socket,
+      companyId,
+      conversationType: "voice",
+    });
 
-socket.conversationId = conversationId;
+    socket.conversationId = conversationId;
 
-clientManager.createConversation(
-  conversationId,
-  socket,
-  companyId
-);
+    clientManager.createConversation(conversationId, socket, companyId);
 
-console.log(
-  "🆕 New voice conversation started:",
-  conversationId
-);
+    console.log("🆕 New voice conversation started:", conversationId);
 
     const session = await this.ai.live.connect({
       model: MODEL,
@@ -283,28 +276,15 @@ console.log(
 
           this.completionRequested.set(socket, true);
 
-          const session = this.sessions.get(socket);
-
-          if (session) {
-            session.sendToolResponse({
-              functionResponses: [
-                {
-                  name: functionCall.name,
-                  id: functionCall.id,
-                  response: {
-                    result: "Conversation ending.",
-                  },
-                },
-              ],
-            });
-          }
-
-          // Tell frontend immediately
           socket.send(
             JSON.stringify({
               type: "CONVERSATION_COMPLETE",
             }),
           );
+
+          // VERY IMPORTANT:
+          // Do not process anything else from this Gemini message.
+          return;
         }
 
         if (functionCall.name === "connect_representative") {
@@ -376,6 +356,10 @@ console.log(
           continue;
         }
       }
+    }
+
+    if (this.completionRequested.get(socket) === true) {
+      return;
     }
 
     const parts = message.serverContent?.modelTurn?.parts || [];
