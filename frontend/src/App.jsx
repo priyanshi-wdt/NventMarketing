@@ -11,7 +11,7 @@ function App() {
     async function loadCompany() {
       try {
         const response = await fetch(
-          `http://nventmarketing.onrender.com/company/${companyId}`,
+          `https://nventmarketing.onrender.com/company/${companyId}`,
         );
 
         const data = await response.json();
